@@ -16,17 +16,20 @@
 package node
 
 import (
-	"strconv"
-
 	"bytes"
 	"context"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -120,32 +123,58 @@ func verifyCRIU(ctx context.Context, execHost func(context.Context, []string, st
 	return strings.Contains(raw, "Looks good"), raw
 }
 
+// isRetryableAPIError identifies transient Kubernetes API errors suitable for backoff retry.
+func isRetryableAPIError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return apierrors.IsConflict(err) ||
+		apierrors.IsServerTimeout(err) ||
+		apierrors.IsTooManyRequests(err) ||
+		apierrors.IsServiceUnavailable(err) ||
+		apierrors.IsInternalError(err) ||
+		apierrors.IsTimeout(err)
+}
+
 // annotateNode publishes the node's CRIU capability verdict, version, and optional reason/remediation.
-func annotateNode(ctx context.Context, c client.Client, nodeName, version, reason, remediation string, ready bool) error {
-	var node corev1.Node
-	if err := c.Get(ctx, types.NamespacedName{Name: nodeName}, &node); err != nil {
-		return err
+// Uses the provided client.Reader for live reads and retries transient API errors with exponential backoff.
+func annotateNode(ctx context.Context, c client.Client, reader client.Reader, nodeName, version, reason, remediation string, ready bool) error {
+	r := reader
+	if r == nil {
+		r = c
 	}
-	patch := client.MergeFrom(node.DeepCopy())
-	if node.Annotations == nil {
-		node.Annotations = map[string]string{}
+	backoff := wait.Backoff{
+		Steps:    5,
+		Duration: 100 * time.Millisecond,
+		Factor:   2.0,
+		Jitter:   0.1,
 	}
-	node.Annotations[NodeAnnotationCRIUReady] = fmt.Sprintf("%t", ready)
-	if version != "" {
-		node.Annotations[NodeAnnotationCRIUVersion] = version
-	}
-	if ready {
-		delete(node.Annotations, NodeAnnotationCRIUReason)
-		delete(node.Annotations, NodeAnnotationCRIURemediation)
-	} else {
-		if reason != "" {
-			node.Annotations[NodeAnnotationCRIUReason] = reason
+	return retry.OnError(backoff, isRetryableAPIError, func() error {
+		var node corev1.Node
+		if err := r.Get(ctx, types.NamespacedName{Name: nodeName}, &node); err != nil {
+			return err
 		}
-		if remediation != "" {
-			node.Annotations[NodeAnnotationCRIURemediation] = remediation
+		patch := client.MergeFrom(node.DeepCopy())
+		if node.Annotations == nil {
+			node.Annotations = map[string]string{}
 		}
-	}
-	return c.Patch(ctx, &node, patch)
+		node.Annotations[NodeAnnotationCRIUReady] = fmt.Sprintf("%t", ready)
+		if version != "" {
+			node.Annotations[NodeAnnotationCRIUVersion] = version
+		}
+		if ready {
+			delete(node.Annotations, NodeAnnotationCRIUReason)
+			delete(node.Annotations, NodeAnnotationCRIURemediation)
+		} else {
+			if reason != "" {
+				node.Annotations[NodeAnnotationCRIUReason] = reason
+			}
+			if remediation != "" {
+				node.Annotations[NodeAnnotationCRIURemediation] = remediation
+			}
+		}
+		return c.Patch(ctx, &node, patch)
+	})
 }
 
 // copyFile installs src at dst atomically via temp-file + rename so an

@@ -18,6 +18,7 @@ package node
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -75,7 +76,7 @@ func TestNode_DemoteAndRecoverOnContainerdRestart(t *testing.T) {
 		nd.ready = true
 		nd.version = "v3.19"
 		nd.mu.Unlock()
-		return annotateNode(ctx, nd.Client, nd.NodeName, "v3.19", "", "", true)
+		return annotateNode(ctx, nd.Client, nd.reader(), nd.NodeName, "v3.19", "", "", true)
 	}
 
 	// 1. Initial bootstrap
@@ -140,17 +141,16 @@ func TestNode_DemoteAndRecoverOnContainerdRestart(t *testing.T) {
 		t.Fatalf("expected bootstrapped still 1, got %d", bootstrapped)
 	}
 
-	// 4. Simulate containerd restart: remove socket and create new one (new inode)
-	if err := os.Remove(sockPath); err != nil {
-		t.Fatalf("remove sock: %v", err)
-	}
-	// Consume the freed inode with a dummy file to ensure the new socket receives a distinct inode
-	dummy := filepath.Join(tmpDir, "dummy")
-	if err := os.WriteFile(dummy, []byte("dummy"), 0o600); err != nil {
-		t.Fatalf("write dummy: %v", err)
-	}
-	if err := os.WriteFile(sockPath, []byte("sock2"), 0o600); err != nil {
-		t.Fatalf("write sock2: %v", err)
+	// 4. Simulate containerd restart: remove socket and create new one with distinct inode
+	oldIno, _ := getSocketInode(sockPath)
+	for i := 0; i < 50; i++ {
+		_ = os.Remove(sockPath)
+		dummy := filepath.Join(tmpDir, fmt.Sprintf("dummy-%d", i))
+		_ = os.WriteFile(dummy, []byte("dummy"), 0o600)
+		_ = os.WriteFile(sockPath, []byte("sock2"), 0o600)
+		if ino, _ := getSocketInode(sockPath); ino != 0 && ino != oldIno {
+			break
+		}
 	}
 
 	// 5. Probe after containerd restart: new inode detected, triggers re-bootstrap!

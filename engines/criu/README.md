@@ -70,10 +70,12 @@ The CRIU snapshot engine consists of three binaries built from this Go module
 2. **`cmd/agent` (privileged node DaemonSet):**
    - At startup (`node.Bootstrap`), installs a self-contained CRIU >= 3.19
      bundle into `/var/lib/pod-migrate/criu-bundle` and `/usr/local/sbin/criu`,
-     writes `/etc/criu/runc.conf`, runs `criu check` in the host namespaces via
-     `nsenter`, and stamps `pod-migrate.io/criu-ready` and
+     writes `/etc/criu/runc.conf`, verifies containerd's configuration (`enable_criu != false`)
+     and process PATH / shim PATH reachability of the `criu` binary (#130), runs `criu check`
+     in the host namespaces via `nsenter`, and stamps `pod-migrate.io/criu-ready` and
      `pod-migrate.io/criu-version` on the `Node`.
-     If containerd cached a failed CRIU lookup (e.g. before criu was on its PATH),
+     If containerd has `enable_criu = false`, cannot resolve `criu` on its PATH, or previously
+     cached a failed CRIU lookup (e.g. before criu was on its PATH),
      the agent marks the node `pod-migrate.io/criu-ready: false` with reason and
      remediation annotations (`pod-migrate.io/criu-reason` and `pod-migrate.io/criu-remediation`).
      The agent mounts `/run/containerd` and continuously probes containerd's socket;

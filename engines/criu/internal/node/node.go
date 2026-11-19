@@ -26,6 +26,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -40,7 +41,8 @@ import (
 // capability probe.
 type Node struct {
 	client.Client
-	NodeName string
+	APIReader client.Reader
+	NodeName  string
 
 	Kubelet  *kubeletCheckpoint
 	Restorer *restorer
@@ -56,11 +58,35 @@ type Node struct {
 
 	statSocketFn func(string) (uint64, error)
 	bootstrapFn  func(context.Context) error
+
+	containerdConfigPath string
+	containerdPidFn      func() (int, error)
+	containerdEnvironFn  func(int) ([]byte, error)
+	readConfigFileFn     func(string) ([]byte, error)
+	criuVersionFn        func(context.Context, string) (int, error)
+	installBundleFn      func() (string, error)
+}
+
+func (n *Node) installBundle() (string, error) {
+	if n != nil && n.installBundleFn != nil {
+		return n.installBundleFn()
+	}
+	return installCRIUBundle()
+}
+
+func (n *Node) reader() client.Reader {
+	if n != nil && n.APIReader != nil {
+		return n.APIReader
+	}
+	if n != nil {
+		return n.Client
+	}
+	return nil
 }
 
 // NewNode wires the node worker against containerd and the local kubelet
 // checkpoint endpoint.
-func NewNode(c client.Client, nodeName string) (*Node, error) {
+func NewNode(c client.Client, reader client.Reader, nodeName string) (*Node, error) {
 	cc, err := containerd.New("/run/containerd/containerd.sock",
 		containerd.WithDefaultNamespace("k8s.io"))
 	if err != nil {
@@ -68,6 +94,7 @@ func NewNode(c client.Client, nodeName string) (*Node, error) {
 	}
 	return &Node{
 		Client:       c,
+		APIReader:    reader,
 		NodeName:     nodeName,
 		Kubelet:      newKubeletCheckpoint(),
 		Restorer:     newRestorer(cc),
@@ -115,15 +142,31 @@ func (n *Node) recordSocketInodeLocked() {
 func (n *Node) bootstrapInternal(ctx context.Context) error {
 	log := logf.FromContext(ctx)
 	var nodeObj corev1.Node
-	if err := n.Client.Get(ctx, types.NamespacedName{Name: n.NodeName}, &nodeObj); err != nil {
+	if err := n.reader().Get(ctx, types.NamespacedName{Name: n.NodeName}, &nodeObj); err != nil {
 		return err
 	}
 	if err := CheckContainerdVersion(nodeObj.Status.NodeInfo.ContainerRuntimeVersion); err != nil {
-		_ = annotateNode(ctx, n.Client, n.NodeName, "", "unsupported containerd version: "+err.Error(), "upgrade containerd", false)
+		_ = annotateNode(ctx, n.Client, n.reader(), n.NodeName, "", "unsupported containerd version: "+err.Error(), "upgrade containerd", false)
 		return err
 	}
-	version, err := installCRIUBundle()
+	version, err := n.installBundle()
 	if err != nil {
+		return err
+	}
+	if err := n.CheckContainerdCRIUReadiness(ctx); err != nil {
+		reason := err.Error()
+		remediation := "ensure containerd has enable_criu=true and criu is on containerd's PATH"
+		if strings.Contains(err.Error(), ReasonContainerdCRIUDisabled) {
+			reason = ReasonContainerdCRIUDisabled
+			remediation = RemediationContainerdCRIUDisabled
+		} else if strings.Contains(err.Error(), ReasonCRIUNotOnContainerdPATH) {
+			reason = ReasonCRIUNotOnContainerdPATH
+			remediation = RemediationCRIUNotOnContainerdPATH
+		} else if strings.Contains(err.Error(), ReasonCRIUVersionTooOld) {
+			reason = ReasonCRIUVersionTooOld
+			remediation = RemediationUpgradeCRIU
+		}
+		_ = annotateNode(ctx, n.Client, n.reader(), n.NodeName, version, reason, remediation, false)
 		return err
 	}
 	ok, raw := verifyCRIU(ctx, n.Restorer.execHost)
@@ -140,7 +183,7 @@ func (n *Node) bootstrapInternal(ctx context.Context) error {
 		reason = "criu check --all failed"
 		remediation = "check host kernel support for CRIU"
 	}
-	return annotateNode(ctx, n.Client, n.NodeName, version, reason, remediation, ok)
+	return annotateNode(ctx, n.Client, n.reader(), n.NodeName, version, reason, remediation, ok)
 }
 
 // DemoteNode marks the node unready with reason and remediation, preserving existing version.
@@ -153,7 +196,7 @@ func (n *Node) DemoteNode(ctx context.Context, reason, remediation string) error
 	ver := n.version
 	n.mu.Unlock()
 
-	return annotateNode(ctx, n.Client, n.NodeName, ver, reason, remediation, false)
+	return annotateNode(ctx, n.Client, n.reader(), n.NodeName, ver, reason, remediation, false)
 }
 
 // IsReady returns whether the node is currently considered CRIU-ready.

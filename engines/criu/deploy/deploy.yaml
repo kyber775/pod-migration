@@ -56,10 +56,21 @@ metadata:
     pod-migrate.io/component: psengine
 rules:
   - apiGroups: ["podsnapshot.gke.io"]
-    resources: ["podsnapshotstorageconfigs", "podsnapshotpolicies", "podsnapshotmanualtriggers", "podsnapshots"]
+    resources:
+      [
+        "podsnapshotstorageconfigs",
+        "podsnapshotpolicies",
+        "podsnapshotmanualtriggers",
+        "podsnapshots",
+      ]
     verbs: ["get", "list", "watch", "create"]
   - apiGroups: ["podsnapshot.gke.io"]
-    resources: ["podsnapshotpolicies/status", "podsnapshotmanualtriggers/status", "podsnapshots/status"]
+    resources:
+      [
+        "podsnapshotpolicies/status",
+        "podsnapshotmanualtriggers/status",
+        "podsnapshots/status",
+      ]
     verbs: ["get", "update", "patch"]
   - apiGroups: ["apiextensions.k8s.io"]
     resources: ["customresourcedefinitions"]
@@ -282,6 +293,9 @@ spec:
               readOnly: true
             - name: etc-criu
               mountPath: /etc/criu
+            - name: etc-containerd
+              mountPath: /etc/containerd
+              readOnly: true
             - name: host-sbin
               mountPath: /usr/local/sbin
       volumes:
@@ -308,6 +322,10 @@ spec:
         - name: etc-criu
           hostPath:
             path: /etc/criu
+            type: DirectoryOrCreate
+        - name: etc-containerd
+          hostPath:
+            path: /etc/containerd
             type: DirectoryOrCreate
         - name: host-sbin
           hostPath:
